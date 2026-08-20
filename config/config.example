@@ -1,0 +1,9 @@
+# My Py Lib configuration example
+
+# Default audio format
+FORMAT=m4a
+
+# Default output directory
+OUTPUT_DIR=/storage/emulated/0/Download/SpotDL
+
+# You can customize these values for your own setup.
