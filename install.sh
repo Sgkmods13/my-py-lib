@@ -1,1517 +1,618 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
+# ============================================================
+#                    My Py Lib - SpotDL
+#          Universal Diagnose-First Installer
+#
+#   Every device is profiled first (arch, RAM, free storage,
+#   Android version, network). Based on that diagnosis the
+#   script picks the best install path for THIS device:
+#
+#     - DEBIAN mode  : proot-distro + Debian + venv (default,
+#                       best isolation, used on capable devices)
+#     - NATIVE mode   : installs directly inside Termux with no
+#                       proot-distro/Debian layer at all (used on
+#                       low-RAM / low-storage / unsupported-arch
+#                       devices, or if Debian fails to start)
+#
+#   Every step is idempotent — safe to re-run any time to
+#   repair, update, or switch modes.
+#
+#                    Credit: @Sgkmods13
+# ============================================================
+
 set -e
 
 CREDIT="@Sgkmods13"
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
-
-# ============================================================
-#                 My Py Lib - SpotDL
-#          Complete Termux + Debian Installer
-#                 Termux:Widget Support
-#                 Credit: @Sgkmods13
-# ============================================================
-
-banner() {
-    clear
-    echo "================================================"
-    echo "              My Py Lib - SpotDL"
-    echo "          Termux + Debian + Python"
-    echo "              Termux:Widget"
-    echo "              Credit: $CREDIT"
-    echo "================================================"
-    echo
-}
-
-banner
+MODE_FILE="$HOME/.spotdl-install-mode"
 
 # ------------------------------------------------------------
-# Check Termux (real detection, not just a PREFIX default check)
+# Colors
 # ------------------------------------------------------------
-# The old check `[ -z "$PREFIX" ]` could never fail, because PREFIX is
-# given a default value on the line above it. We need to test for
-# something that is only true when actually running inside Termux.
 
-is_termux() {
-    # 1) Termux sets this env var itself
-    [ -n "$TERMUX_VERSION" ] && return 0
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[1;36m'
+BOLD='\033[1m'
+RESET='\033[0m'
 
-    # 2) The Termux prefix path is distinctive
-    case "$PREFIX" in
-        */com.termux/*) : ;;
-        *) return 1 ;;
-    esac
+info() { echo -e "${CYAN}[INFO]${RESET} $1"; }
+ok()   { echo -e "${GREEN}[OK]${RESET} $1"; }
+warn() { echo -e "${YELLOW}[WARNING]${RESET} $1"; }
+fail() { echo -e "${RED}[ERROR]${RESET} $1"; }
+step() { echo -e "\n${BOLD}$1${RESET}"; }
 
-    # 3) A Termux-only binary should be on PATH
-    command -v termux-info >/dev/null 2>&1 || command -v termux-setup-storage >/dev/null 2>&1 || return 1
+clear
 
-    return 0
-}
+echo "================================================"
+echo "              My Py Lib - SpotDL"
+echo "================================================"
+echo "     Universal Diagnose-First Installer"
+echo "              $CREDIT"
+echo "================================================"
+echo
 
-if ! is_termux; then
-    echo "ERROR: This installer must be run inside Termux on Android."
-    echo "       (Termux environment / com.termux prefix not detected.)"
+# ------------------------------------------------------------
+# Termux sanity check
+# ------------------------------------------------------------
+
+if [ ! -d "/data/data/com.termux" ]; then
+    fail "This installer must be run inside Termux."
     exit 1
 fi
 
-# Also bail early with a clear message if this Android device's arch
-# isn't one proot-distro/Debian actually supports.
-case "$(uname -m)" in
-    aarch64|arm64|armv7l|armv8l|x86_64|i686) ;;
+if ! command -v pkg >/dev/null 2>&1; then
+    fail "Termux package manager (pkg) was not found."
+    fail "Make sure you're running the official Termux app (F-Droid or GitHub build)."
+    exit 1
+fi
+
+pkg update -y >/dev/null 2>&1 || warn "Could not refresh package lists (offline?)."
+pkg install -y coreutils curl ca-certificates >/dev/null 2>&1 || true
+
+# ============================================================
+#                     DIAGNOSTIC PHASE
+# ============================================================
+
+step "[DIAGNOSE] Scanning device..."
+
+# --- Architecture -------------------------------------------------
+ARCH="$(uname -m)"
+
+# --- Android version (best effort) --------------------------------
+ANDROID_VERSION="unknown"
+if command -v getprop >/dev/null 2>&1; then
+    ANDROID_VERSION="$(getprop ro.build.version.release 2>/dev/null || echo unknown)"
+fi
+
+# --- SDK / API level (helps flag very old Android builds) ---------
+SDK_LEVEL="unknown"
+if command -v getprop >/dev/null 2>&1; then
+    SDK_LEVEL="$(getprop ro.build.version.sdk 2>/dev/null || echo unknown)"
+fi
+
+# --- RAM ------------------------------------------------------------
+TOTAL_RAM_MB=0
+if [ -r /proc/meminfo ]; then
+    TOTAL_RAM_MB="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)"
+fi
+
+# --- Free storage in Termux home ------------------------------------
+FREE_STORAGE_MB=0
+if command -v df >/dev/null 2>&1; then
+    FREE_STORAGE_MB="$(df -m "$HOME" 2>/dev/null | awk 'NR==2 {print $4}')"
+    [ -z "$FREE_STORAGE_MB" ] && FREE_STORAGE_MB=0
+fi
+
+# --- CPU cores --------------------------------------------------------
+CPU_CORES="$(nproc 2>/dev/null || echo 1)"
+
+# --- Network reachability ----------------------------------------------
+NETWORK_OK=0
+if curl -fsSL --max-time 6 https://pypi.org >/dev/null 2>&1; then
+    NETWORK_OK=1
+fi
+
+# --- proot-distro / Debian architecture support ------------------------
+# proot-distro's Debian rootfs is only published for these arches.
+DEBIAN_ARCH_OK=0
+case "$ARCH" in
+    aarch64|arm64|armv7l|armv8l|arm|x86_64|i686|i386|x86)
+        DEBIAN_ARCH_OK=1
+        ;;
     *)
-        echo "ERROR: Unsupported device architecture: $(uname -m)"
-        exit 1
+        DEBIAN_ARCH_OK=0
         ;;
 esac
 
 # ------------------------------------------------------------
-# Install required Termux packages
+# Report
 # ------------------------------------------------------------
 
-echo "[1/10] Updating Termux..."
-pkg update -y
-
 echo
-echo "[2/10] Installing required Termux packages..."
+echo "------------------ DEVICE REPORT ------------------"
+printf "%-22s %s\n" "Architecture:"     "$ARCH"
+printf "%-22s %s\n" "Android version:"  "$ANDROID_VERSION (SDK $SDK_LEVEL)"
+printf "%-22s %s MB\n" "Total RAM:"     "$TOTAL_RAM_MB"
+printf "%-22s %s MB\n" "Free storage:"  "$FREE_STORAGE_MB"
+printf "%-22s %s\n" "CPU cores:"        "$CPU_CORES"
+if [ "$NETWORK_OK" -eq 1 ]; then
+    printf "%-22s %s\n" "Network:" "OK"
+else
+    printf "%-22s %s\n" "Network:" "UNREACHABLE"
+fi
+echo "-----------------------------------------------------"
+echo
 
-pkg install -y \
-    proot-distro \
-    coreutils \
-    grep \
-    sed \
-    curl
-
-if ! command -v proot-distro >/dev/null 2>&1; then
-    echo "ERROR: proot-distro failed to install. Aborting."
+if [ "$NETWORK_OK" -eq 0 ]; then
+    fail "No internet connectivity detected. Connect to a network and re-run this installer."
     exit 1
 fi
 
 # ------------------------------------------------------------
-# Storage permission
+# Decide install mode
+#
+# DEBIAN mode needs: supported arch, reasonable free storage
+# (Debian rootfs + build toolchain + venv ≈ 900MB-1.2GB), and
+# at least a little RAM headroom for compiling wheels.
+#
+# Anything below those thresholds — or an arch proot-distro's
+# Debian doesn't ship for — falls back to NATIVE mode, which
+# installs Python/ffmpeg/spotdl straight into Termux with no
+# extra rootfs, using far less RAM and storage.
 # ------------------------------------------------------------
 
-echo
-echo "[3/10] Requesting Termux storage permission..."
+INSTALL_MODE="debian"
+REASONS=()
 
-if [ ! -d "$HOME/storage/shared" ]; then
-    termux-setup-storage || true
-    sleep 3
+if [ "$DEBIAN_ARCH_OK" -eq 0 ]; then
+    INSTALL_MODE="native"
+    REASONS+=("architecture '$ARCH' has no proot-distro Debian build")
 fi
 
-# ------------------------------------------------------------
-# Debian
-# ------------------------------------------------------------
-# proot-distro's `list` output format has changed across versions
-# (spacing, "installed" wording, added color codes, etc.), so grepping
-# its text is unreliable. Checking the actual installed-rootfs
-# directory is a stable signal that works regardless of CLI output
-# formatting.
+if [ "$FREE_STORAGE_MB" -gt 0 ] && [ "$FREE_STORAGE_MB" -lt 1200 ]; then
+    INSTALL_MODE="native"
+    REASONS+=("free storage is low (${FREE_STORAGE_MB}MB, Debian needs ~1.2GB+)")
+fi
 
-debian_installed() {
-    # Preferred: ask proot-distro itself, ignoring formatting differences
-    if proot-distro list 2>/dev/null | grep -Eiq '(^|[^a-z])debian([^a-z]|$).*(installed|\*)'; then
-        return 0
+if [ "$TOTAL_RAM_MB" -gt 0 ] && [ "$TOTAL_RAM_MB" -lt 1024 ]; then
+    INSTALL_MODE="native"
+    REASONS+=("device RAM is very low (${TOTAL_RAM_MB}MB)")
+fi
+
+# Respect an explicit override: ./install.sh --native or --debian
+for arg in "$@"; do
+    case "$arg" in
+        --native) INSTALL_MODE="native"; REASONS=("forced by --native flag") ;;
+        --debian)
+            if [ "$DEBIAN_ARCH_OK" -eq 1 ]; then
+                INSTALL_MODE="debian"; REASONS=("forced by --debian flag")
+            else
+                warn "--debian was requested but this architecture ($ARCH) has no Debian build. Staying on native mode."
+            fi
+            ;;
+    esac
+done
+
+if [ "$INSTALL_MODE" = "native" ]; then
+    warn "Selected install path: NATIVE (direct Termux install, no Debian)"
+    for r in "${REASONS[@]:-}"; do
+        [ -n "$r" ] && warn "  - $r"
+    done
+else
+    ok "Selected install path: DEBIAN (proot-distro, full isolation)"
+fi
+
+# Build-thread tuning based on RAM (used by both modes)
+if [ "$TOTAL_RAM_MB" -gt 0 ]; then
+    if [ "$TOTAL_RAM_MB" -le 2048 ]; then
+        BUILD_JOBS=1
+    elif [ "$TOTAL_RAM_MB" -le 4096 ]; then
+        BUILD_JOBS=2
+    else
+        BUILD_JOBS="$CPU_CORES"
     fi
-    # Fallback: check on-disk rootfs directly
-    [ -d "$PREFIX/var/lib/proot-distro/installed-rootfs/debian" ] && return 0
-    return 1
+else
+    BUILD_JOBS=1
+fi
+
+echo "$INSTALL_MODE" > "$MODE_FILE"
+
+# ------------------------------------------------------------
+# Helper: install a Termux package only if missing
+# ------------------------------------------------------------
+
+ensure_termux_pkg() {
+    local pkg_name="$1"
+    if ! dpkg -s "$pkg_name" >/dev/null 2>&1; then
+        info "Installing missing package: $pkg_name"
+        pkg install -y "$pkg_name"
+    else
+        ok "$pkg_name already present, skipping."
+    fi
 }
 
-echo
-echo "[4/10] Checking Debian..."
+# ------------------------------------------------------------
+# Storage permission (both modes need it for saving music)
+# ------------------------------------------------------------
 
-if debian_installed; then
-    echo "Debian already installed."
-else
-    echo "Installing Debian..."
-    proot-distro install debian
+step "[SETUP] Checking Android storage permission..."
+
+if [ ! -d "$HOME/storage/shared" ]; then
+    if command -v termux-setup-storage >/dev/null 2>&1; then
+        echo "Android will ask for storage permission. Please press ALLOW."
+        termux-setup-storage || true
+        sleep 3
+    fi
 fi
 
-# ------------------------------------------------------------
-# Debian SpotDL setup
-# ------------------------------------------------------------
+if [ -d "$HOME/storage/shared" ]; then
+    ok "Storage is available."
+else
+    warn "Storage is not available. Run: termux-setup-storage"
+fi
 
-echo
-echo "[5/10] Installing SpotDL inside Debian..."
+MUSIC_DIR="$HOME/storage/shared/Music/SpotDL"
+mkdir -p "$MUSIC_DIR" 2>/dev/null || true
 
-cat > "$PREFIX/.spotdl_debian_setup.sh" <<'DEBIAN_SETUP'
+# ============================================================
+#                        DEBIAN MODE
+# ============================================================
+
+install_debian_mode() {
+    step "[DEBIAN] Installing base Termux requirements..."
+
+    for p in proot-distro coreutils curl wget grep sed ca-certificates; do
+        ensure_termux_pkg "$p"
+    done
+
+    if ! command -v proot-distro >/dev/null 2>&1; then
+        fail "proot-distro could not be installed."
+        exit 1
+    fi
+
+    step "[DEBIAN] Checking Debian rootfs..."
+
+    debian_works() {
+        proot-distro login debian -- /bin/true >/dev/null 2>&1
+    }
+
+    if debian_works; then
+        ok "Debian is already installed and working — skipping install."
+    else
+        if proot-distro list 2>/dev/null | grep -Eiq '^\s*debian'; then
+            info "Debian rootfs entry exists but failed to start. Reinstalling..."
+            proot-distro reset debian >/dev/null 2>&1 || true
+            proot-distro install debian
+        else
+            info "Installing Debian..."
+            proot-distro install debian
+        fi
+
+        if ! debian_works; then
+            fail "Debian could not be started even after reinstalling."
+            warn "Falling back to NATIVE mode instead."
+            INSTALL_MODE="native"
+            echo "native" > "$MODE_FILE"
+            install_native_mode
+            return
+        fi
+        ok "Debian is installed and working."
+    fi
+
+    step "[DEBIAN] Installing SpotDL inside Debian..."
+
+    SETUP="$PREFIX/.spotdl-debian-setup"
+
+    cat > "$SETUP" <<DEBIAN_SETUP
 #!/bin/bash
-
 set -e
-
-echo "================================================"
-echo "             Debian SpotDL Setup"
-echo "                @Sgkmods13"
-echo "================================================"
-echo
-
 export DEBIAN_FRONTEND=noninteractive
 
-apt update
-apt upgrade -y
+echo "[1/6] Updating Debian package lists..."
+apt-get update
 
-apt install -y \
-    python3 \
-    python3-pip \
-    python3-venv \
-    ffmpeg \
-    curl \
-    ca-certificates
-
-if [ ! -d "$HOME/spotdl-env" ]; then
-    python3 -m venv "$HOME/spotdl-env"
+echo "[2/6] Checking required system packages..."
+NEEDED_PKGS=""
+for p in python3 python3-pip python3-venv python3-dev ffmpeg curl wget \\
+         ca-certificates build-essential pkg-config libjpeg-dev zlib1g-dev \\
+         libpng-dev libtiff-dev libfreetype6-dev liblcms2-dev libwebp-dev; do
+    if ! dpkg -s "\$p" >/dev/null 2>&1; then
+        NEEDED_PKGS="\$NEEDED_PKGS \$p"
+    fi
+done
+if [ -n "\$NEEDED_PKGS" ]; then
+    echo "Installing missing packages:\$NEEDED_PKGS"
+    apt-get install -y \$NEEDED_PKGS
+else
+    echo "All required system packages already installed."
 fi
 
-source "$HOME/spotdl-env/bin/activate"
+echo "[3/6] Setting up virtual environment..."
+VENV="\$HOME/spotdl-env"
+[ -d "\$VENV" ] || python3 -m venv "\$VENV"
+source "\$VENV/bin/activate"
 
-python -m pip install --upgrade pip
-python -m pip install --upgrade spotdl
+export MAKEFLAGS="-j$BUILD_JOBS"
+export CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_JOBS"
+export PIP_NO_CACHE_DIR="1"
+export PYTHONDONTWRITEBYTECODE="1"
 
-echo
-echo "Checking SpotDL..."
+echo "[4/6] Updating pip tools..."
+python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+echo "[5/6] Installing Pillow + SpotDL..."
+python -m pip install --no-cache-dir --upgrade Pillow
+python -m pip install --no-cache-dir --upgrade spotdl
+
+echo "[6/6] Verifying..."
+python --version
+ffmpeg -version | head -n 1
 spotdl --version
-
-echo
-echo "================================================"
-echo "        SpotDL installation complete"
-echo "                @Sgkmods13"
-echo "================================================"
+python -c "import PIL; print('Pillow', PIL.__version__)"
+echo "SpotDL (Debian mode) installation successful."
 DEBIAN_SETUP
 
-chmod +x "$PREFIX/.spotdl_debian_setup.sh"
-
-proot-distro login debian -- \
-    bash -c "
-        cp '$PREFIX/.spotdl_debian_setup.sh' /root/setup-spotdl.sh
-        chmod +x /root/setup-spotdl.sh
-        /root/setup-spotdl.sh
-        rm -f /root/setup-spotdl.sh
-    "
-
-rm -f "$PREFIX/.spotdl_debian_setup.sh"
-
-# ------------------------------------------------------------
-# Create Termux command
-# ------------------------------------------------------------
-
-echo
-echo "[6/10] Creating spotdl-debian command..."
-
-cat > "$PREFIX/bin/spotdl-debian" <<'LAUNCHER'
-#!/data/data/com.termux/files/usr/bin/bash
-
-echo "================================================"
-echo "             SpotDL - @Sgkmods13"
-echo "================================================"
-echo
-
-proot-distro login debian -- \
-bash -lc '
-if [ ! -f "$HOME/spotdl-env/bin/activate" ]; then
-    echo "ERROR: SpotDL environment not found."
-    exit 1
-fi
-
-source "$HOME/spotdl-env/bin/activate"
-
-if [ "$#" -eq 0 ]; then
-    spotdl --help
-else
-    spotdl "$@"
-fi
-' -- "$@"
-LAUNCHER
-
-chmod +x "$PREFIX/bin/spotdl-debian"
-
-# ------------------------------------------------------------
-# Create Widget directories
-# ------------------------------------------------------------
-
-echo
-echo "[7/10] Creating Termux:Widget directories..."
-
-mkdir -p "$HOME/.shortcuts"
-mkdir -p "$HOME/.shortcuts/tasks"
-
-# ------------------------------------------------------------
-# Create complete Widget
-# ------------------------------------------------------------
-
-echo
-echo "[8/10] Creating SpotDL Widget..."
-
-cat > "$HOME/.shortcuts/SpotDL" <<'WIDGET'
-#!/data/data/com.termux/files/usr/bin/bash
-
-CREDIT="@Sgkmods13"
-
-# ============================================================
-#                    SPOTDL WIDGET
-#                    @Sgkmods13
-# ============================================================
-
-clear
-
-echo "================================================"
-echo "                SPOTDL DOWNLOADER"
-echo "                Credit: $CREDIT"
-echo "================================================"
-echo
-
-# ------------------------------------------------------------
-# Storage
-# ------------------------------------------------------------
-
-if [ ! -d "$HOME/storage/shared" ]; then
-    echo "Requesting storage permission..."
-    termux-setup-storage || true
-    sleep 3
-fi
-
-if [ ! -d "$HOME/storage/shared" ]; then
-    echo
-    echo "Storage permission is required."
-    echo "Please allow Termux storage access."
-    echo
-    read -p "Press Enter to close..."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Debian check (rootfs-directory check, not fragile text grep)
-# ------------------------------------------------------------
-
-DEBIAN_ROOTFS="$PREFIX/var/lib/proot-distro/installed-rootfs/debian"
-
-if [ ! -d "$DEBIAN_ROOTFS" ] && ! proot-distro list 2>/dev/null | grep -Eiq '(^|[^a-z])debian([^a-z]|$).*(installed|\*)'; then
-    echo "Debian is not installed."
-    echo "Please run the main installer again."
-    read -p "Press Enter to close..."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# SpotDL check
-# ------------------------------------------------------------
-
-if ! proot-distro login debian -- \
-    bash -lc 'test -f "$HOME/spotdl-env/bin/activate"'
-then
-    echo "SpotDL environment not found."
-    echo "Please run the main installer again."
-    read -p "Press Enter to close..."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Select storage
-# ------------------------------------------------------------
-
-while true
-do
-    clear
-
-    echo "================================================"
-    echo "          SPOTDL - DOWNLOAD LOCATION"
-    echo "                 $CREDIT"
-    echo "================================================"
-    echo
-    echo "1) Download/Spotube"
-    echo "2) Music"
-    echo "3) Download"
-    echo "4) DCIM"
-    echo "5) Custom folder"
-    echo "6) Enter full Android path"
-    echo "7) Exit"
-    echo
-
-    read -p "Select [1-7]: " CHOICE
-
-    case "$CHOICE" in
-
-        1)
-            OUT="$HOME/storage/shared/Download/Spotube"
-            break
-            ;;
-
-        2)
-            OUT="$HOME/storage/shared/Music"
-            break
-            ;;
-
-        3)
-            OUT="$HOME/storage/shared/Download"
-            break
-            ;;
-
-        4)
-            OUT="$HOME/storage/shared/DCIM"
-            break
-            ;;
-
-        5)
-            echo
-            echo "Example:"
-            echo "$HOME/storage/shared/MyMusic"
-            echo
-            read -p "Folder path: " OUT
-
-            if [ -z "$OUT" ]; then
-                echo "Invalid folder."
-                sleep 2
-            else
-                break
-            fi
-            ;;
-
-        6)
-            echo
-            echo "Example:"
-            echo "/storage/emulated/0/Music/SpotDL"
-            echo
-            read -p "Android path: " OUT
-
-            if [ -z "$OUT" ]; then
-                echo "Invalid path."
-                sleep 2
-            else
-                break
-            fi
-            ;;
-
-        7)
-            exit 0
-            ;;
-
-        *)
-            echo "Invalid choice."
-            sleep 2
-            ;;
-    esac
-done
-
-# ------------------------------------------------------------
-# Create folder
-# ------------------------------------------------------------
-
-mkdir -p "$OUT"
-
-if [ ! -d "$OUT" ]; then
-    echo
-    echo "Unable to create:"
-    echo "$OUT"
-    read -p "Press Enter to close..."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Spotify URL
-# ------------------------------------------------------------
-
-clear
-
-echo "================================================"
-echo "                SPOTDL DOWNLOADER"
-echo "                Credit: $CREDIT"
-echo "================================================"
-echo
-echo "Save location:"
-echo "$OUT"
-echo
-
-read -p "Enter Spotify URL: " URL
-
-if [ -z "$URL" ]; then
-    echo
-    echo "No URL entered."
-    read -p "Press Enter to close..."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Download M4A
-# ------------------------------------------------------------
-
-echo
-echo "Starting SpotDL..."
-echo
-
-proot-distro login debian -- \
-bash -lc '
-source "$HOME/spotdl-env/bin/activate"
-
-spotdl \
-    --output "'"$OUT"'/{artist} - {title}.{output-ext}" \
-    --format m4a \
-    "'"$URL"'"
-'
-
-echo
-echo "================================================"
-echo "                 DOWNLOAD DONE"
-echo "================================================"
-echo
-echo "Location:"
-echo "$OUT"
-echo
-echo "Credit: $CREDIT"
-echo
-read -p "Press Enter to close..."
-WIDGET
-
-chmod 700 "$HOME/.shortcuts/SpotDL"
-
-# ------------------------------------------------------------
-# Permissions/settings helper
-# ------------------------------------------------------------
-
-echo
-echo "[9/10] Creating permission helper..."
-
-cat > "$PREFIX/bin/spotdl-permissions" <<'PERMISSIONS'
-#!/data/data/com.termux/files/usr/bin/bash
-
-echo "=========================================="
-echo "       SpotDL Android Permissions"
-echo "              @Sgkmods13"
-echo "=========================================="
-echo
-echo "1) Termux overlay"
-echo "2) Termux:Widget overlay"
-echo "3) Termux unknown-app sources"
-echo "4) Termux:Widget unknown-app sources"
-echo "5) Storage permission"
-echo "6) Exit"
-echo
-
-read -p "Select: " P
-
-case "$P" in
-    1)
-        am start \
-        -a android.settings.action.MANAGE_OVERLAY_PERMISSION \
-        -d package:com.termux
-        ;;
-    2)
-        am start \
-        -a android.settings.action.MANAGE_OVERLAY_PERMISSION \
-        -d package:com.termux.widget
-        ;;
-    3)
-        am start \
-        -a android.settings.MANAGE_UNKNOWN_APP_SOURCES \
-        -d package:com.termux
-        ;;
-    4)
-        am start \
-        -a android.settings.MANAGE_UNKNOWN_APP_SOURCES \
-        -d package:com.termux.widget
-        ;;
-    5)
-        termux-setup-storage
-        ;;
-    6)
-        exit 0
-        ;;
-esac
-PERMISSIONS
-
-chmod +x "$PREFIX/bin/spotdl-permissions"
-
-# ------------------------------------------------------------
-# Finish
-# ------------------------------------------------------------
-
-echo
-echo "[10/10] Finalizing..."
-
-echo
-echo "================================================"
-echo "                    SUCCESS"
-echo "================================================"
-echo
-echo "                 Credit: @Sgkmods13"
-echo
-echo "SpotDL installed successfully."
-echo
-echo "Termux command:"
-echo "  spotdl-debian"
-echo
-echo "Widget:"
-echo "  SpotDL"
-echo
-echo "The Widget supports:"
-echo "  - M4A output"
-echo "  - Custom download location"
-echo "  - Storage permission"
-echo "  - Debian + SpotDL automatically"
-echo
-echo "================================================"
-echo "       IMPORTANT: Termux:Widget APK"
-echo "       must be installed separately."
-echo "================================================"
-echo
-echo "If Widget is installed, add it to your"
-echo "Android home screen and refresh it."
-echo
-echo "                 @Sgkmods13"
-echo "================================================"
-    ca-certificates
-
-if [ ! -d "$HOME/spotdl-env" ]; then
-    python3 -m venv "$HOME/spotdl-env"
-fi
-
-source "$HOME/spotdl-env/bin/activate"
-
-python -m pip install --upgrade pip
-python -m pip install --upgrade spotdl
-
-echo
-echo "Checking SpotDL..."
-spotdl --version
-
-echo
-echo "================================================"
-echo "        SpotDL installation complete"
-echo "                @Sgkmods13"
-echo "================================================"
-DEBIAN_SETUP
-
-chmod +x "$PREFIX/.spotdl_debian_setup.sh"
-
-proot-distro login debian -- \
-    bash -c "
-        cp '$PREFIX/.spotdl_debian_setup.sh' /root/setup-spotdl.sh
-        chmod +x /root/setup-spotdl.sh
-        /root/setup-spotdl.sh
-        rm -f /root/setup-spotdl.sh
-    "
-
-rm -f "$PREFIX/.spotdl_debian_setup.sh"
-
-# ------------------------------------------------------------
-# Create Termux command
-# ------------------------------------------------------------
-
-echo
-echo "[6/10] Creating spotdl-debian command..."
-
-cat > "$PREFIX/bin/spotdl-debian" <<'LAUNCHER'
-#!/data/data/com.termux/files/usr/bin/bash
-
-echo "================================================"
-echo "             SpotDL - @Sgkmods13"
-echo "================================================"
-echo
-
-proot-distro login debian -- \
-bash -lc '
-if [ ! -f "$HOME/spotdl-env/bin/activate" ]; then
-    echo "ERROR: SpotDL environment not found."
-    exit 1
-fi
-
-source "$HOME/spotdl-env/bin/activate"
-
-if [ "$#" -eq 0 ]; then
-    spotdl --help
-else
-    spotdl "$@"
-fi
-' -- "$@"
-LAUNCHER
-
-chmod +x "$PREFIX/bin/spotdl-debian"
-
-# ------------------------------------------------------------
-# Create Widget directories
-# ------------------------------------------------------------
-
-echo
-echo "[7/10] Creating Termux:Widget directories..."
-
-mkdir -p "$HOME/.shortcuts"
-mkdir -p "$HOME/.shortcuts/tasks"
-
-# ------------------------------------------------------------
-# Create complete Widget
-# ------------------------------------------------------------
-
-echo
-echo "[8/10] Creating SpotDL Widget..."
-
-cat > "$HOME/.shortcuts/SpotDL" <<'WIDGET'
-#!/data/data/com.termux/files/usr/bin/bash
-
-CREDIT="@Sgkmods13"
-
-# ============================================================
-#                    SPOTDL WIDGET
-#                    @Sgkmods13
-# ============================================================
-
-clear
-
-echo "================================================"
-echo "                SPOTDL DOWNLOADER"
-echo "                Credit: $CREDIT"
-echo "================================================"
-echo
-
-# ------------------------------------------------------------
-# Storage
-# ------------------------------------------------------------
-
-if [ ! -d "$HOME/storage/shared" ]; then
-    echo "Requesting storage permission..."
-    termux-setup-storage || true
-    sleep 3
-fi
-
-if [ ! -d "$HOME/storage/shared" ]; then
-    echo
-    echo "Storage permission is required."
-    echo "Please allow Termux storage access."
-    echo
-    read -p "Press Enter to close..."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Debian check
-# ------------------------------------------------------------
-
-if ! proot-distro list 2>/dev/null | grep -qi "debian.*installed"; then
-    echo "Debian is not installed."
-    echo "Please run the main installer again."
-    read -p "Press Enter to close..."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# SpotDL check
-# ------------------------------------------------------------
-
-if ! proot-distro login debian -- \
-    bash -lc 'test -f "$HOME/spotdl-env/bin/activate"'
-then
-    echo "SpotDL environment not found."
-    echo "Please run the main installer again."
-    read -p "Press Enter to close..."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Select storage
-# ------------------------------------------------------------
-
-while true
-do
-    clear
-
-    echo "================================================"
-    echo "          SPOTDL - DOWNLOAD LOCATION"
-    echo "                 $CREDIT"
-    echo "================================================"
-    echo
-    echo "1) Download/Spotube"
-    echo "2) Music"
-    echo "3) Download"
-    echo "4) DCIM"
-    echo "5) Custom folder"
-    echo "6) Enter full Android path"
-    echo "7) Exit"
-    echo
-
-    read -p "Select [1-7]: " CHOICE
-
-    case "$CHOICE" in
-
-        1)
-            OUT="$HOME/storage/shared/Download/Spotube"
-            break
-            ;;
-
-        2)
-            OUT="$HOME/storage/shared/Music"
-            break
-            ;;
-
-        3)
-            OUT="$HOME/storage/shared/Download"
-            break
-            ;;
-
-        4)
-            OUT="$HOME/storage/shared/DCIM"
-            break
-            ;;
-
-        5)
-            echo
-            echo "Example:"
-            echo "$HOME/storage/shared/MyMusic"
-            echo
-            read -p "Folder path: " OUT
-
-            if [ -z "$OUT" ]; then
-                echo "Invalid folder."
-                sleep 2
-            else
-                break
-            fi
-            ;;
-
-        6)
-            echo
-            echo "Example:"
-            echo "/storage/emulated/0/Music/SpotDL"
-            echo
-            read -p "Android path: " OUT
-
-            if [ -z "$OUT" ]; then
-                echo "Invalid path."
-                sleep 2
-            else
-                break
-            fi
-            ;;
-
-        7)
-            exit 0
-            ;;
-
-        *)
-            echo "Invalid choice."
-            sleep 2
-            ;;
-    esac
-done
-
-# ------------------------------------------------------------
-# Create folder
-# ------------------------------------------------------------
-
-mkdir -p "$OUT"
-
-if [ ! -d "$OUT" ]; then
-    echo
-    echo "Unable to create:"
-    echo "$OUT"
-    read -p "Press Enter to close..."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Spotify URL
-# ------------------------------------------------------------
-
-clear
-
-echo "================================================"
-echo "                SPOTDL DOWNLOADER"
-echo "                Credit: $CREDIT"
-echo "================================================"
-echo
-echo "Save location:"
-echo "$OUT"
-echo
-
-read -p "Enter Spotify URL: " URL
-
-if [ -z "$URL" ]; then
-    echo
-    echo "No URL entered."
-    read -p "Press Enter to close..."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Download M4A
-# ------------------------------------------------------------
-
-echo
-echo "Starting SpotDL..."
-echo
-
-proot-distro login debian -- \
-bash -lc '
-source "$HOME/spotdl-env/bin/activate"
-
-spotdl \
-    --output "'"$OUT"'/{artist} - {title}.{output-ext}" \
-    --format m4a \
-    "'"$URL"'"
-'
-
-echo
-echo "================================================"
-echo "                 DOWNLOAD DONE"
-echo "================================================"
-echo
-echo "Location:"
-echo "$OUT"
-echo
-echo "Credit: $CREDIT"
-echo
-read -p "Press Enter to close..."
-WIDGET
-
-chmod 700 "$HOME/.shortcuts/SpotDL"
-
-# ------------------------------------------------------------
-# Permissions/settings helper
-# ------------------------------------------------------------
-
-echo
-echo "[9/10] Creating permission helper..."
-
-cat > "$PREFIX/bin/spotdl-permissions" <<'PERMISSIONS'
-#!/data/data/com.termux/files/usr/bin/bash
-
-echo "=========================================="
-echo "       SpotDL Android Permissions"
-echo "              @Sgkmods13"
-echo "=========================================="
-echo
-echo "1) Termux overlay"
-echo "2) Termux:Widget overlay"
-echo "3) Termux unknown-app sources"
-echo "4) Termux:Widget unknown-app sources"
-echo "5) Storage permission"
-echo "6) Exit"
-echo
-
-read -p "Select: " P
-
-case "$P" in
-    1)
-        am start \
-        -a android.settings.action.MANAGE_OVERLAY_PERMISSION \
-        -d package:com.termux
-        ;;
-    2)
-        am start \
-        -a android.settings.action.MANAGE_OVERLAY_PERMISSION \
-        -d package:com.termux.widget
-        ;;
-    3)
-        am start \
-        -a android.settings.MANAGE_UNKNOWN_APP_SOURCES \
-        -d package:com.termux
-        ;;
-    4)
-        am start \
-        -a android.settings.MANAGE_UNKNOWN_APP_SOURCES \
-        -d package:com.termux.widget
-        ;;
-    5)
-        termux-setup-storage
-        ;;
-    6)
-        exit 0
-        ;;
-esac
-PERMISSIONS
-
-chmod +x "$PREFIX/bin/spotdl-permissions"
-
-# ------------------------------------------------------------
-# Finish
-# ------------------------------------------------------------
-
-echo
-echo "[10/10] Finalizing..."
-
-echo
-echo "================================================"
-echo "                    SUCCESS"
-echo "================================================"
-echo
-echo "                 Credit: @Sgkmods13"
-echo
-echo "SpotDL installed successfully."
-echo
-echo "Termux command:"
-echo "  spotdl-debian"
-echo
-echo "Widget:"
-echo "  SpotDL"
-echo
-echo "The Widget supports:"
-echo "  - M4A output"
-echo "  - Custom download location"
-echo "  - Storage permission"
-echo "  - Debian + SpotDL automatically"
-echo
-echo "================================================"
-echo "       IMPORTANT: Termux:Widget APK"
-echo "       must be installed separately."
-echo "================================================"
-echo
-echo "If Widget is installed, add it to your"
-echo "Android home screen and refresh it."
-echo
-echo "                 @Sgkmods13"
-echo "================================================"#!/data/data/com.termux/files/usr/bin/bash
-
-set -e
-
-CREDIT="@Sgkmods13"
-PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
-
-# ============================================================
-#                 My Py Lib - SpotDL
-#          Complete Termux + Debian Installer
-#                 Termux:Widget Support
-#                 Credit: @Sgkmods13
-# ============================================================
-
-banner() {
-    clear
-    echo "================================================"
-    echo "              My Py Lib - SpotDL"
-    echo "          Termux + Debian + Python"
-    echo "              Termux:Widget"
-    echo "              Credit: $CREDIT"
-    echo "================================================"
-    echo
+    chmod +x "$SETUP"
+
+    proot-distro login debian -- \
+        bash -c "
+            cp '$SETUP' /root/setup-spotdl.sh
+            chmod +x /root/setup-spotdl.sh
+            /root/setup-spotdl.sh
+            rm -f /root/setup-spotdl.sh
+        "
+
+    rm -f "$SETUP"
+
+    if ! proot-distro login debian -- bash -lc 'test -x "$HOME/spotdl-env/bin/spotdl"'; then
+        fail "SpotDL executable was not found after install."
+        exit 1
+    fi
+
+    ok "SpotDL is installed (Debian mode)."
 }
 
-banner
+# ============================================================
+#                        NATIVE MODE
+# ============================================================
+
+install_native_mode() {
+    step "[NATIVE] Installing directly inside Termux (no Debian layer)..."
+
+    for p in python build-essential libjpeg-turbo zlib libpng libwebp \
+             freetype ffmpeg curl wget ca-certificates; do
+        ensure_termux_pkg "$p" || warn "Optional package '$p' unavailable on this Termux repo — continuing."
+    done
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        fail "Python could not be installed via pkg."
+        exit 1
+    fi
+
+    VENV="$HOME/spotdl-env-native"
+    if [ ! -d "$VENV" ]; then
+        info "Creating native virtual environment..."
+        python3 -m venv "$VENV"
+    else
+        ok "Native virtual environment already exists — reusing it."
+    fi
+
+    # shellcheck disable=SC1090
+    source "$VENV/bin/activate"
+
+    export MAKEFLAGS="-j$BUILD_JOBS"
+    export PIP_NO_CACHE_DIR="1"
+    export PYTHONDONTWRITEBYTECODE="1"
+
+    info "Updating pip tools (using $BUILD_JOBS build thread(s))..."
+    python -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+    info "Installing Pillow..."
+    python -m pip install --no-cache-dir --upgrade Pillow
+
+    info "Installing SpotDL..."
+    python -m pip install --no-cache-dir --upgrade spotdl
+
+    deactivate 2>/dev/null || true
+
+    if [ ! -x "$VENV/bin/spotdl" ]; then
+        fail "SpotDL executable was not found after native install."
+        exit 1
+    fi
+
+    ok "SpotDL is installed (Native mode)."
+}
 
 # ------------------------------------------------------------
-# Check Termux
+# Run the selected mode
 # ------------------------------------------------------------
 
-if [ -z "$PREFIX" ]; then
-    echo "ERROR: Run this installer inside Termux."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Install required Termux packages
-# ------------------------------------------------------------
-
-echo "[1/10] Updating Termux..."
-pkg update -y
-
-echo
-echo "[2/10] Installing required Termux packages..."
-
-pkg install -y \
-    proot-distro \
-    coreutils \
-    grep \
-    sed \
-    curl
-
-# ------------------------------------------------------------
-# Storage permission
-# ------------------------------------------------------------
-
-echo
-echo "[3/10] Requesting Termux storage permission..."
-
-if [ ! -d "$HOME/storage/shared" ]; then
-    termux-setup-storage || true
-    sleep 3
-fi
-
-# ------------------------------------------------------------
-# Debian
-# ------------------------------------------------------------
-
-echo
-echo "[4/10] Checking Debian..."
-
-if proot-distro list 2>/dev/null | grep -qi "debian.*installed"; then
-    echo "Debian already installed."
+if [ "$INSTALL_MODE" = "debian" ]; then
+    install_debian_mode
 else
-    echo "Installing Debian..."
-    proot-distro install debian
+    install_native_mode
 fi
-
-# ------------------------------------------------------------
-# Debian SpotDL setup
-# ------------------------------------------------------------
-
-echo
-echo "[5/10] Installing SpotDL inside Debian..."
-
-cat > "$PREFIX/.spotdl_debian_setup.sh" <<'DEBIAN_SETUP'
-#!/bin/bash
-
-set -e
-
-echo "================================================"
-echo "             Debian SpotDL Setup"
-echo "                @Sgkmods13"
-echo "================================================"
-echo
-
-export DEBIAN_FRONTEND=noninteractive
-
-apt update
-apt upgrade -y
-
-apt install -y \
-    python3 \
-    python3-pip \
-    python3-venv \
-    ffmpeg \
-    curl \
-    ca-certificates
-
-if [ ! -d "$HOME/spotdl-env" ]; then
-    python3 -m venv "$HOME/spotdl-env"
-fi
-
-source "$HOME/spotdl-env/bin/activate"
-
-python -m pip install --upgrade pip
-python -m pip install --upgrade spotdl
-
-echo
-echo "Checking SpotDL..."
-spotdl --version
-
-echo
-echo "================================================"
-echo "        SpotDL installation complete"
-echo "                @Sgkmods13"
-echo "================================================"
-DEBIAN_SETUP
-
-chmod +x "$PREFIX/.spotdl_debian_setup.sh"
-
-proot-distro login debian -- \
-    bash -c "
-        cp '$PREFIX/.spotdl_debian_setup.sh' /root/setup-spotdl.sh
-        chmod +x /root/setup-spotdl.sh
-        /root/setup-spotdl.sh
-        rm -f /root/setup-spotdl.sh
-    "
-
-rm -f "$PREFIX/.spotdl_debian_setup.sh"
-
-# ------------------------------------------------------------
-# Create Termux command
-# ------------------------------------------------------------
-
-echo
-echo "[6/10] Creating spotdl-debian command..."
-
-cat > "$PREFIX/bin/spotdl-debian" <<'LAUNCHER'
-#!/data/data/com.termux/files/usr/bin/bash
-
-echo "================================================"
-echo "             SpotDL - @Sgkmods13"
-echo "================================================"
-echo
-
-proot-distro login debian -- \
-bash -lc '
-if [ ! -f "$HOME/spotdl-env/bin/activate" ]; then
-    echo "ERROR: SpotDL environment not found."
-    exit 1
-fi
-
-source "$HOME/spotdl-env/bin/activate"
-
-if [ "$#" -eq 0 ]; then
-    spotdl --help
-else
-    spotdl "$@"
-fi
-' -- "$@"
-LAUNCHER
-
-chmod +x "$PREFIX/bin/spotdl-debian"
-
-# ------------------------------------------------------------
-# Create Widget directories
-# ------------------------------------------------------------
-
-echo
-echo "[7/10] Creating Termux:Widget directories..."
-
-mkdir -p "$HOME/.shortcuts"
-mkdir -p "$HOME/.shortcuts/tasks"
-
-# ------------------------------------------------------------
-# Create complete Widget
-# ------------------------------------------------------------
-
-echo
-echo "[8/10] Creating SpotDL Widget..."
-
-cat > "$HOME/.shortcuts/SpotDL" <<'WIDGET'
-#!/data/data/com.termux/files/usr/bin/bash
-
-CREDIT="@Sgkmods13"
 
 # ============================================================
-#                    SPOTDL WIDGET
+#           UNIVERSAL LAUNCHER (mode-aware, single command)
+# ============================================================
+
+step "[LAUNCHER] Creating unified 'spotdl-debian' command..."
+
+LAUNCHER_PATH="$PREFIX/bin/spotdl-debian"
+
+cat > "$LAUNCHER_PATH" <<LAUNCHER
+#!/data/data/com.termux/files/usr/bin/bash
+
+# ============================================================
+#                    SpotDL Launcher (universal)
 #                    @Sgkmods13
 # ============================================================
 
-clear
+MODE_FILE="\$HOME/.spotdl-install-mode"
+MODE="debian"
+[ -f "\$MODE_FILE" ] && MODE="\$(cat "\$MODE_FILE")"
 
+if [ "\$MODE" = "native" ]; then
+    VENV="\$HOME/spotdl-env-native"
+    if [ ! -x "\$VENV/bin/spotdl" ]; then
+        echo "ERROR: Native SpotDL environment not found."
+        echo "Re-run the installer to fix this."
+        exit 1
+    fi
+    source "\$VENV/bin/activate"
+    if [ "\$#" -eq 0 ]; then
+        spotdl --help
+    else
+        spotdl "\$@"
+    fi
+else
+    if ! command -v proot-distro >/dev/null 2>&1; then
+        echo "ERROR: proot-distro is not installed."
+        exit 1
+    fi
+    if ! proot-distro login debian -- /bin/true >/dev/null 2>&1; then
+        echo "ERROR: Debian cannot be started."
+        echo "Run: proot-distro list"
+        exit 1
+    fi
+    proot-distro login debian -- \\
+        bash -lc '
+            if [ ! -f "\$HOME/spotdl-env/bin/activate" ]; then
+                echo "ERROR: SpotDL environment not found."
+                echo "Re-run the installer to fix this."
+                exit 1
+            fi
+            source "\$HOME/spotdl-env/bin/activate"
+            if [ "\$#" -eq 0 ]; then
+                spotdl --help
+            else
+                spotdl "\$@"
+            fi
+        ' -- "\$@"
+fi
+LAUNCHER
+
+chmod +x "$LAUNCHER_PATH"
+ok "spotdl-debian command is ready (mode: $INSTALL_MODE)."
+
+# ------------------------------------------------------------
+# Widget
+# ------------------------------------------------------------
+
+step "[WIDGET] Creating Termux:Widget shortcut..."
+
+mkdir -p "$HOME/.shortcuts" "$HOME/.shortcuts/tasks"
+
+cat > "$HOME/.shortcuts/SpotDL" <<WIDGET
+#!/data/data/com.termux/files/usr/bin/bash
+
+CREDIT="@Sgkmods13"
+clear
 echo "================================================"
-echo "                SPOTDL DOWNLOADER"
-echo "                Credit: $CREDIT"
+echo "              SPOTDL DOWNLOADER"
+echo "              Credit: \$CREDIT"
 echo "================================================"
 echo
 
-# ------------------------------------------------------------
-# Storage
-# ------------------------------------------------------------
-
-if [ ! -d "$HOME/storage/shared" ]; then
-    echo "Requesting storage permission..."
+if [ ! -d "\$HOME/storage/shared" ]; then
+    echo "Storage permission is required. Requesting..."
     termux-setup-storage || true
     sleep 3
 fi
 
-if [ ! -d "$HOME/storage/shared" ]; then
-    echo
-    echo "Storage permission is required."
-    echo "Please allow Termux storage access."
-    echo
-    read -p "Press Enter to close..."
+if [ ! -d "\$HOME/storage/shared" ]; then
+    echo "ERROR: Android storage is unavailable."
+    echo "Run this in Termux: termux-setup-storage"
+    read -p "Press Enter to exit..."
     exit 1
 fi
 
-# ------------------------------------------------------------
-# Debian check
-# ------------------------------------------------------------
+MODE_FILE="\$HOME/.spotdl-install-mode"
+MODE="debian"
+[ -f "\$MODE_FILE" ] && MODE="\$(cat "\$MODE_FILE")"
 
-if ! proot-distro list 2>/dev/null | grep -qi "debian.*installed"; then
-    echo "Debian is not installed."
-    echo "Please run the main installer again."
-    read -p "Press Enter to close..."
-    exit 1
+DOWNLOAD_DIR="\$HOME/storage/shared/Music/SpotDL"
+mkdir -p "\$DOWNLOAD_DIR"
+
+echo "Mode: \$MODE"
+echo "Downloads will be saved to:"
+echo "\$DOWNLOAD_DIR"
+echo
+
+read -p "Paste a Spotify/YouTube link (or search term): " QUERY
+
+if [ -z "\$QUERY" ]; then
+    echo "No input given. Exiting."
+    read -p "Press Enter to exit..."
+    exit 0
 fi
 
-# ------------------------------------------------------------
-# SpotDL check
-# ------------------------------------------------------------
+echo
+echo "Starting download..."
+echo
 
-if ! proot-distro login debian -- \
-    bash -lc 'test -f "$HOME/spotdl-env/bin/activate"'
-then
-    echo "SpotDL environment not found."
-    echo "Please run the main installer again."
-    read -p "Press Enter to close..."
-    exit 1
+if [ "\$MODE" = "native" ]; then
+    VENV="\$HOME/spotdl-env-native"
+    if [ ! -x "\$VENV/bin/spotdl" ]; then
+        echo "ERROR: SpotDL not installed. Re-run the main installer."
+        read -p "Press Enter to exit..."
+        exit 1
+    fi
+    source "\$VENV/bin/activate"
+    cd "\$DOWNLOAD_DIR"
+    spotdl download "\$QUERY"
+else
+    if ! command -v proot-distro >/dev/null 2>&1 || ! proot-distro login debian -- /bin/true >/dev/null 2>&1; then
+        echo "ERROR: Debian is not available. Re-run the main installer to repair it."
+        read -p "Press Enter to exit..."
+        exit 1
+    fi
+    proot-distro login debian -- \\
+        bash -lc "
+            source \\"\\\$HOME/spotdl-env/bin/activate\\"
+            mkdir -p \\"\\\$HOME/spotdl-output\\"
+            spotdl download '\$QUERY' --output '/root/spotdl-output/{title}.{output-ext}'
+        "
+    echo
+    echo "Files were saved inside Debian at ~/spotdl-output"
+    echo "Move them into \$DOWNLOAD_DIR to see them in your Music app."
 fi
 
-# ------------------------------------------------------------
-# Select storage
-# ------------------------------------------------------------
-
-while true
-do
-    clear
-
-    echo "================================================"
-    echo "          SPOTDL - DOWNLOAD LOCATION"
-    echo "                 $CREDIT"
-    echo "================================================"
-    echo
-    echo "1) Download/Spotube"
-    echo "2) Music"
-    echo "3) Download"
-    echo "4) DCIM"
-    echo "5) Custom folder"
-    echo "6) Enter full Android path"
-    echo "7) Exit"
-    echo
-
-    read -p "Select [1-7]: " CHOICE
-
-    case "$CHOICE" in
-
-        1)
-            OUT="$HOME/storage/shared/Download/Spotube"
-            break
-            ;;
-
-        2)
-            OUT="$HOME/storage/shared/Music"
-            break
-            ;;
-
-        3)
-            OUT="$HOME/storage/shared/Download"
-            break
-            ;;
-
-        4)
-            OUT="$HOME/storage/shared/DCIM"
-            break
-            ;;
-
-        5)
-            echo
-            echo "Example:"
-            echo "$HOME/storage/shared/MyMusic"
-            echo
-            read -p "Folder path: " OUT
-
-            if [ -z "$OUT" ]; then
-                echo "Invalid folder."
-                sleep 2
-            else
-                break
-            fi
-            ;;
-
-        6)
-            echo
-            echo "Example:"
-            echo "/storage/emulated/0/Music/SpotDL"
-            echo
-            read -p "Android path: " OUT
-
-            if [ -z "$OUT" ]; then
-                echo "Invalid path."
-                sleep 2
-            else
-                break
-            fi
-            ;;
-
-        7)
-            exit 0
-            ;;
-
-        *)
-            echo "Invalid choice."
-            sleep 2
-            ;;
-    esac
-done
-
-# ------------------------------------------------------------
-# Create folder
-# ------------------------------------------------------------
-
-mkdir -p "$OUT"
-
-if [ ! -d "$OUT" ]; then
-    echo
-    echo "Unable to create:"
-    echo "$OUT"
-    read -p "Press Enter to close..."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Spotify URL
-# ------------------------------------------------------------
-
-clear
-
-echo "================================================"
-echo "                SPOTDL DOWNLOADER"
-echo "                Credit: $CREDIT"
-echo "================================================"
 echo
-echo "Save location:"
-echo "$OUT"
-echo
-
-read -p "Enter Spotify URL: " URL
-
-if [ -z "$URL" ]; then
-    echo
-    echo "No URL entered."
-    read -p "Press Enter to close..."
-    exit 1
-fi
-
-# ------------------------------------------------------------
-# Download M4A
-# ------------------------------------------------------------
-
-echo
-echo "Starting SpotDL..."
-echo
-
-proot-distro login debian -- \
-bash -lc '
-source "$HOME/spotdl-env/bin/activate"
-
-spotdl \
-    --output "'"$OUT"'/{artist} - {title}.{output-ext}" \
-    --format m4a \
-    "'"$URL"'"
-'
-
-echo
-echo "================================================"
-echo "                 DOWNLOAD DONE"
-echo "================================================"
-echo
-echo "Location:"
-echo "$OUT"
-echo
-echo "Credit: $CREDIT"
-echo
-read -p "Press Enter to close..."
+read -p "Press Enter to exit..."
 WIDGET
 
-chmod 700 "$HOME/.shortcuts/SpotDL"
+chmod +x "$HOME/.shortcuts/SpotDL"
+ok "Widget shortcut created: SpotDL"
 
 # ------------------------------------------------------------
-# Permissions/settings helper
-# ------------------------------------------------------------
-
-echo
-echo "[9/10] Creating permission helper..."
-
-cat > "$PREFIX/bin/spotdl-permissions" <<'PERMISSIONS'
-#!/data/data/com.termux/files/usr/bin/bash
-
-echo "=========================================="
-echo "       SpotDL Android Permissions"
-echo "              @Sgkmods13"
-echo "=========================================="
-echo
-echo "1) Termux overlay"
-echo "2) Termux:Widget overlay"
-echo "3) Termux unknown-app sources"
-echo "4) Termux:Widget unknown-app sources"
-echo "5) Storage permission"
-echo "6) Exit"
-echo
-
-read -p "Select: " P
-
-case "$P" in
-    1)
-        am start \
-        -a android.settings.action.MANAGE_OVERLAY_PERMISSION \
-        -d package:com.termux
-        ;;
-    2)
-        am start \
-        -a android.settings.action.MANAGE_OVERLAY_PERMISSION \
-        -d package:com.termux.widget
-        ;;
-    3)
-        am start \
-        -a android.settings.MANAGE_UNKNOWN_APP_SOURCES \
-        -d package:com.termux
-        ;;
-    4)
-        am start \
-        -a android.settings.MANAGE_UNKNOWN_APP_SOURCES \
-        -d package:com.termux.widget
-        ;;
-    5)
-        termux-setup-storage
-        ;;
-    6)
-        exit 0
-        ;;
-esac
-PERMISSIONS
-
-chmod +x "$PREFIX/bin/spotdl-permissions"
-
-# ------------------------------------------------------------
-# Finish
+# Summary
 # ------------------------------------------------------------
 
 echo
-echo "[10/10] Finalizing..."
-
-echo
 echo "================================================"
-echo "                    SUCCESS"
+echo "        INSTALLATION COMPLETE"
 echo "================================================"
+echo "Mode used:      $INSTALL_MODE"
+echo "Architecture:   $ARCH"
+echo "RAM:            ${TOTAL_RAM_MB}MB"
+echo "Free storage:   ${FREE_STORAGE_MB}MB"
 echo
-echo "                 Credit: @Sgkmods13"
+echo "Run from Termux:"
+echo "  spotdl-debian <spotify-url>"
 echo
-echo "SpotDL installed successfully."
+echo "Or add the 'SpotDL' Termux:Widget to your home screen"
+echo "(long-press home screen -> Widgets -> Termux:Widget)."
 echo
-echo "Termux command:"
-echo "  spotdl-debian"
+echo "Force a specific mode next time with:"
+echo "  bash install.sh --native"
+echo "  bash install.sh --debian"
 echo
-echo "Widget:"
-echo "  SpotDL"
-echo
-echo "The Widget supports:"
-echo "  - M4A output"
-echo "  - Custom download location"
-echo "  - Storage permission"
-echo "  - Debian + SpotDL automatically"
-echo
-echo "================================================"
-echo "       IMPORTANT: Termux:Widget APK"
-echo "       must be installed separately."
+echo "This installer is safe to re-run any time to repair,"
+echo "update, or switch install modes."
 echo "================================================"
 echo
-echo "If Widget is installed, add it to your"
-echo "Android home screen and refresh it."
-echo
-echo "                 @Sgkmods13"
-echo "================================================"echo
-echo "[5/8] Creating SpotDL launcher..."
-
-cat > "$PREFIX/bin/spotdl-debian" <<'EOF'
-#!/data/data/com.termux/files/usr/bin/bash
-
-proot-distro login debian -- bash -c '
-if [ ! -f "$HOME/spotdl-env/bin/activate" ]; then
-    echo "SpotDL environment not found."
-    echo "Run the installer again."
-    exit 1
-fi
-
-source "$HOME/spotdl-env/bin/activate"
-spotdl "$@"
-' -- "$@"
-EOF
-
-chmod +x "$PREFIX/bin/spotdl-debian"
-
-# ------------------------------------------
-# 7. Clean temporary file
-# ------------------------------------------
-
-rm -f "$PREFIX/tmp_my_py_lib_debian.sh"
-
-echo
-echo "[6/8] Installation finished."
-
-# ------------------------------------------
-# 8. Final instructions
-# ------------------------------------------
-
-echo
-echo "=========================================="
-echo "              SUCCESS!"
-echo "=========================================="
-echo
-echo "SpotDL is installed inside Debian."
-echo
-echo "To enter Debian:"
-echo
-echo "  proot-distro login debian"
-echo
-echo "Then:"
-echo
-echo "  source ~/spotdl-env/bin/activate"
-echo "  spotdl --version"
-echo
-echo "Or from normal Termux:"
-echo
-echo "  spotdl-debian --version"
-echo
-echo "=========================================="
