@@ -162,15 +162,15 @@ check_disk_space
 # Install required Termux packages
 # ------------------------------------------------------------
 
-echo "[1/12] Updating Termux..."
+echo "[1/15] Updating Termux..."
 if ! retry pkg update -y >> "$LOGFILE" 2>&1; then
     echo "  WARNING: pkg update failed after retries - continuing anyway,"
     echo "           but package installs below may fail too."
 fi
 
 echo
-echo "[2/12] Installing required Termux packages..."
-if ! retry pkg install -y proot-distro coreutils grep sed curl >> "$LOGFILE" 2>&1; then
+echo "[2/15] Installing required Termux packages..."
+if ! retry pkg install -y proot-distro coreutils grep sed curl unzip >> "$LOGFILE" 2>&1; then
     die "Failed to install required Termux packages after retries. Check: $LOGFILE"
 fi
 
@@ -186,11 +186,131 @@ if ! check_proot_capability; then
 fi
 
 # ------------------------------------------------------------
+# Shizuku (Android/data and Android/obb access)
+# ------------------------------------------------------------
+# Shizuku lets Termux read/write app-private Android/data and Android/obb
+# folders that scoped storage otherwise blocks. It CANNOT be silently
+# installed or silently activated by a script:
+#   - Android will not let an app install another app without the user
+#     tapping through an install prompt (no root here).
+#   - Shizuku itself only starts once the user pairs it via Wireless
+#     Debugging (ADB) or grants it root - both are manual, on-device steps.
+# What this installer *can* do: detect whether it's installed, best-effort
+# detect whether its service is currently running, and launch the Play
+# Store page for the user if it's missing.
+
+SHIZUKU_PKG="moe.shizuku.privileged.api"
+SHIZUKU_PLAY_URL="https://play.google.com/store/apps/details?id=$SHIZUKU_PKG"
+
+shizuku_installed() {
+    pm list packages 2>/dev/null | grep -q "^package:${SHIZUKU_PKG}$"
+}
+
+# Best-effort only: dumpsys needs the DUMP permission, which Termux may
+# or may not have depending on the device/ROM, so a failure here just
+# means "unknown", not "not running".
+shizuku_service_running() {
+    dumpsys activity services 2>/dev/null | grep -qi "$SHIZUKU_PKG"
+}
+
+open_shizuku_play_store() {
+    am start -a android.intent.action.VIEW -d "market://details?id=$SHIZUKU_PKG" \
+        >/dev/null 2>&1 && return 0
+    am start -a android.intent.action.VIEW -d "$SHIZUKU_PLAY_URL" \
+        >/dev/null 2>&1
+}
+
+echo
+echo "[3/15] Checking Shizuku (Android/data & Android/obb access)..."
+
+if shizuku_installed; then
+    echo "Shizuku is installed."
+    if shizuku_service_running; then
+        echo "Shizuku service looks active."
+    else
+        echo "Shizuku is installed but not currently running (or its status"
+        echo "couldn't be determined from Termux)."
+        echo "Open the Shizuku app and start it via Wireless debugging (ADB)"
+        echo "pairing or root - this step has to be done on-device and can't"
+        echo "be automated by this script."
+    fi
+else
+    echo "Shizuku is not installed."
+    echo "Android doesn't allow silent app installs, so this installer can't"
+    echo "install it for you - opening the Play Store listing instead."
+    if open_shizuku_play_store; then
+        echo "Play Store page opened. Install it, then open the Shizuku app"
+        echo "and follow its on-screen steps to activate it (Wireless"
+        echo "debugging pairing, or root if your device is rooted)."
+    else
+        echo "Could not auto-launch the Play Store. Install it manually from:"
+        echo "$SHIZUKU_PLAY_URL"
+    fi
+fi
+
+# ------------------------------------------------------------
+# rish - the actual command that gets read/write access into
+# Android/data and Android/obb once Shizuku's service is running
+# ------------------------------------------------------------
+# rish isn't a separate download - it ships INSIDE the Shizuku APK
+# (assets/rish + assets/rish_shizuku.dex). Installed APKs are readable
+# on the filesystem, so Termux can extract these two files straight out
+# of the installed Shizuku app without root. Once Shizuku's service is
+# actually running (still the manual pairing/root step above - a script
+# cannot do that part), commands run through rish get shell-level (ADB)
+# privilege, which Android exempts from the scoped-storage lock on
+# Android/data and Android/obb - so both read AND write work there,
+# not just read.
+
+RISH_BIN="$PREFIX/bin/rish"
+RISH_DEX="$PREFIX/bin/rish_shizuku.dex"
+
+extract_rish() {
+    command -v unzip >/dev/null 2>&1 || retry pkg install -y unzip >> "$LOGFILE" 2>&1
+
+    local apk_path
+    apk_path="$(pm path "$SHIZUKU_PKG" 2>/dev/null | head -n1 | sed 's/^package://')"
+    if [ -z "$apk_path" ] || [ ! -f "$apk_path" ]; then
+        return 1
+    fi
+
+    unzip -p "$apk_path" assets/rish > "$RISH_BIN" 2>>"$LOGFILE" \
+        && unzip -p "$apk_path" assets/rish_shizuku.dex > "$RISH_DEX" 2>>"$LOGFILE" \
+        || return 1
+
+    [ -s "$RISH_BIN" ] && [ -s "$RISH_DEX" ] || return 1
+    chmod +x "$RISH_BIN"
+    return 0
+}
+
+echo
+echo "[4/15] Setting up rish (Android/data & Android/obb read/write)..."
+
+if [ -s "$RISH_BIN" ] && [ -s "$RISH_DEX" ]; then
+    echo "rish is already extracted."
+elif shizuku_installed; then
+    if extract_rish; then
+        echo "rish extracted to $RISH_BIN"
+        echo "It will only work once Shizuku's service is actually running"
+        echo "(the Wireless debugging/ADB pairing or root step above)."
+        echo "Use it with: spotdl-rish <command>"
+    else
+        echo "Could not extract rish from the installed Shizuku APK."
+        echo "Some devices restrict reading other apps' APK files, or"
+        echo "Shizuku's internal layout changed. Retry later with:"
+        echo "  spotdl-rish-setup"
+    fi
+else
+    echo "Shizuku isn't installed yet, so there's nothing to extract yet."
+    echo "After installing and opening Shizuku, run: spotdl-rish-setup"
+fi
+
+# ------------------------------------------------------------
 # Storage permission (with a real write test, not just dir existence)
 # ------------------------------------------------------------
 
 echo
-echo "[3/12] Requesting Termux storage permission..."
+echo "[5/15] Requesting Termux storage permission..."
 
 if [ ! -d "$HOME/storage/shared" ]; then
     termux-setup-storage || true
@@ -240,7 +360,7 @@ repair_debian() {
 }
 
 echo
-echo "[4/12] Checking Debian..."
+echo "[6/15] Checking Debian..."
 
 if debian_installed; then
     echo "Debian found - verifying it's not corrupted..."
@@ -270,7 +390,7 @@ fi
 # ------------------------------------------------------------
 
 echo
-echo "[5/12] Checking SpotDL inside Debian..."
+echo "[7/15] Checking SpotDL inside Debian..."
 
 # Same idea as the Debian check above: a spotdl-env directory existing
 # doesn't mean it works. A venv can be left half-created (interrupted
@@ -369,7 +489,7 @@ fi
 # ------------------------------------------------------------
 
 echo
-echo "[6/12] Creating spotdl-debian command..."
+echo "[8/15] Creating spotdl-debian command..."
 
 cat > "$PREFIX/bin/spotdl-debian" <<'LAUNCHER'
 #!/data/data/com.termux/files/usr/bin/bash
@@ -404,7 +524,7 @@ chmod +x "$PREFIX/bin/spotdl-debian"
 # ------------------------------------------------------------
 
 echo
-echo "[7/12] Creating spotdl-repair command..."
+echo "[9/15] Creating spotdl-repair command..."
 
 cat > "$PREFIX/bin/spotdl-repair" <<'REPAIR'
 #!/data/data/com.termux/files/usr/bin/bash
@@ -463,7 +583,7 @@ chmod +x "$PREFIX/bin/spotdl-repair"
 # ------------------------------------------------------------
 
 echo
-echo "[8/12] Creating spotdl-doctor diagnostics command..."
+echo "[10/15] Creating spotdl-doctor diagnostics command..."
 
 cat > "$PREFIX/bin/spotdl-doctor" <<'DOCTOR'
 #!/data/data/com.termux/files/usr/bin/bash
@@ -496,6 +616,27 @@ else
     echo "storage/shared : MISSING (run termux-setup-storage)"
 fi
 df -Pk "$HOME" 2>/dev/null | awk 'NR==2 {printf "free space     : %.1f GB\n", $4/1024/1024}'
+echo
+
+echo "-- Shizuku (Android/data & Android/obb access) --"
+SHIZUKU_PKG="moe.shizuku.privileged.api"
+if pm list packages 2>/dev/null | grep -q "^package:${SHIZUKU_PKG}$"; then
+    echo "shizuku app    : installed"
+    if dumpsys activity services 2>/dev/null | grep -qi "$SHIZUKU_PKG"; then
+        echo "shizuku service: appears active"
+    else
+        echo "shizuku service: not detected (may just be unreadable from here -"
+        echo "                 open the Shizuku app to check/start it manually)"
+    fi
+else
+    echo "shizuku app    : NOT installed"
+    echo "                 install: https://play.google.com/store/apps/details?id=$SHIZUKU_PKG"
+fi
+if [ -s "$PREFIX/bin/rish" ] && [ -s "$PREFIX/bin/rish_shizuku.dex" ]; then
+    echo "rish           : extracted (needs Shizuku service running to work)"
+else
+    echo "rish           : NOT set up - run 'spotdl-rish-setup'"
+fi
 echo
 
 echo "-- proot-distro / Debian --"
@@ -545,11 +686,124 @@ DOCTOR
 chmod +x "$PREFIX/bin/spotdl-doctor"
 
 # ------------------------------------------------------------
+# Shizuku helper - check status / open the Play Store page again
+# without re-running the whole installer.
+# ------------------------------------------------------------
+
+echo
+echo "[11/15] Creating spotdl-shizuku helper command..."
+
+cat > "$PREFIX/bin/spotdl-shizuku" <<'SHIZUKU'
+#!/data/data/com.termux/files/usr/bin/bash
+
+SHIZUKU_PKG="moe.shizuku.privileged.api"
+SHIZUKU_PLAY_URL="https://play.google.com/store/apps/details?id=$SHIZUKU_PKG"
+
+echo "================================================"
+echo "              Shizuku - @Sgkmods13"
+echo "================================================"
+echo
+
+if pm list packages 2>/dev/null | grep -q "^package:${SHIZUKU_PKG}$"; then
+    echo "Shizuku is installed."
+    if dumpsys activity services 2>/dev/null | grep -qi "$SHIZUKU_PKG"; then
+        echo "Its service appears to be active."
+    else
+        echo "Its service is not detected as running."
+        echo "Open the Shizuku app and start it (Wireless debugging/ADB"
+        echo "pairing, or root) - this can't be triggered from Termux."
+    fi
+else
+    echo "Shizuku is not installed. Opening the Play Store..."
+    am start -a android.intent.action.VIEW -d "market://details?id=$SHIZUKU_PKG" \
+        >/dev/null 2>&1 || \
+    am start -a android.intent.action.VIEW -d "$SHIZUKU_PLAY_URL" >/dev/null 2>&1 || \
+    echo "Could not open the store automatically. Install manually: $SHIZUKU_PLAY_URL"
+fi
+SHIZUKU
+
+chmod +x "$PREFIX/bin/spotdl-shizuku"
+
+# ------------------------------------------------------------
+# rish setup/usage commands - re-extract rish any time (e.g. if
+# Shizuku was installed after the main installer ran, or updated),
+# and a wrapper to actually run commands through it.
+# ------------------------------------------------------------
+
+echo
+echo "[12/15] Creating spotdl-rish-setup and spotdl-rish commands..."
+
+cat > "$PREFIX/bin/spotdl-rish-setup" <<'RISHSETUP'
+#!/data/data/com.termux/files/usr/bin/bash
+set -uo pipefail
+
+SHIZUKU_PKG="moe.shizuku.privileged.api"
+RISH_BIN="$PREFIX/bin/rish"
+RISH_DEX="$PREFIX/bin/rish_shizuku.dex"
+
+echo "================================================"
+echo "           rish Setup - @Sgkmods13"
+echo "================================================"
+echo
+
+if ! pm list packages 2>/dev/null | grep -q "^package:${SHIZUKU_PKG}\$"; then
+    echo "Shizuku is not installed. Install it first (see 'spotdl-shizuku'),"
+    echo "then re-run this."
+    exit 1
+fi
+
+command -v unzip >/dev/null 2>&1 || pkg install -y unzip
+
+apk_path="$(pm path "$SHIZUKU_PKG" 2>/dev/null | head -n1 | sed 's/^package://')"
+if [ -z "$apk_path" ] || [ ! -f "$apk_path" ]; then
+    echo "Could not locate the installed Shizuku APK (pm path failed)."
+    exit 1
+fi
+
+if unzip -p "$apk_path" assets/rish > "$RISH_BIN" 2>/dev/null \
+    && unzip -p "$apk_path" assets/rish_shizuku.dex > "$RISH_DEX" 2>/dev/null \
+    && [ -s "$RISH_BIN" ] && [ -s "$RISH_DEX" ]; then
+    chmod +x "$RISH_BIN"
+    echo "rish extracted successfully."
+    echo "Make sure Shizuku's service is actually running (open the Shizuku"
+    echo "app - it should say 'Running'), then use: spotdl-rish <command>"
+else
+    echo "Extraction failed. This device may restrict reading other apps'"
+    echo "APK files, or Shizuku's internal layout has changed."
+    exit 1
+fi
+RISHSETUP
+
+chmod +x "$PREFIX/bin/spotdl-rish-setup"
+
+cat > "$PREFIX/bin/spotdl-rish" <<'RISH'
+#!/data/data/com.termux/files/usr/bin/bash
+
+RISH_BIN="$PREFIX/bin/rish"
+
+if [ ! -x "$RISH_BIN" ]; then
+    echo "rish isn't set up yet. Run: spotdl-rish-setup"
+    exit 1
+fi
+
+# Tells Shizuku which app's grant to use - Termux's own package.
+export RISH_APPLICATION_ID="com.termux"
+
+if [ "$#" -eq 0 ]; then
+    exec "$RISH_BIN"
+else
+    exec "$RISH_BIN" -c "$*"
+fi
+RISH
+
+chmod +x "$PREFIX/bin/spotdl-rish"
+
+# ------------------------------------------------------------
 # Create Widget directories
 # ------------------------------------------------------------
 
 echo
-echo "[9/12] Creating Termux:Widget directories..."
+echo "[13/15] Creating Termux:Widget directories..."
 
 mkdir -p "$HOME/.shortcuts"
 mkdir -p "$HOME/.shortcuts/tasks"
@@ -559,7 +813,7 @@ mkdir -p "$HOME/.shortcuts/tasks"
 # ------------------------------------------------------------
 
 echo
-echo "[10/12] Creating SpotDL Widget..."
+echo "[14/15] Creating SpotDL Widget..."
 
 cat > "$HOME/.shortcuts/SpotDL" <<'WIDGET'
 #!/data/data/com.termux/files/usr/bin/bash
@@ -716,7 +970,7 @@ chmod 700 "$HOME/.shortcuts/SpotDL"
 # ------------------------------------------------------------
 
 echo
-echo "[11/12] Creating permission helper..."
+echo "[15/15] Creating permission helper..."
 
 cat > "$PREFIX/bin/spotdl-permissions" <<'PERMISSIONS'
 #!/data/data/com.termux/files/usr/bin/bash
@@ -731,7 +985,8 @@ echo "2) Termux:Widget overlay"
 echo "3) Termux unknown-app sources"
 echo "4) Termux:Widget unknown-app sources"
 echo "5) Storage permission"
-echo "6) Exit"
+echo "6) Shizuku (Play Store page)"
+echo "7) Exit"
 echo
 
 read -p "Select: " P
@@ -742,7 +997,9 @@ case "$P" in
     3) am start -a android.settings.MANAGE_UNKNOWN_APP_SOURCES -d package:com.termux ;;
     4) am start -a android.settings.MANAGE_UNKNOWN_APP_SOURCES -d package:com.termux.widget ;;
     5) termux-setup-storage ;;
-    6) exit 0 ;;
+    6) am start -a android.intent.action.VIEW -d "market://details?id=moe.shizuku.privileged.api" 2>/dev/null || \
+       am start -a android.intent.action.VIEW -d "https://play.google.com/store/apps/details?id=moe.shizuku.privileged.api" ;;
+    7) exit 0 ;;
 esac
 PERMISSIONS
 
@@ -753,7 +1010,7 @@ chmod +x "$PREFIX/bin/spotdl-permissions"
 # ------------------------------------------------------------
 
 echo
-echo "[12/12] Finalizing..."
+echo "Finalizing..."
 
 echo
 echo "================================================"
@@ -768,6 +1025,10 @@ echo "Termux commands:"
 echo "  spotdl-debian    - run spotdl directly"
 echo "  spotdl-doctor    - diagnose problems on this device"
 echo "  spotdl-repair    - fix a corrupted Debian or SpotDL install"
+echo "  spotdl-shizuku   - check/install Shizuku (Android/data & obb access)"
+echo "  spotdl-rish-setup - (re)extract rish once Shizuku is installed"
+echo "  spotdl-rish <cmd> - run a command with Android/data & obb read/write"
+echo "                      access (needs Shizuku's service running first)"
 echo
 echo "Widget:"
 echo "  SpotDL"
@@ -786,4 +1047,4 @@ echo "Android home screen and refresh it."
 echo
 echo "                 @Sgkmods13"
 echo "================================================"
-
+ 
