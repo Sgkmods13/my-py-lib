@@ -10,6 +10,26 @@ CREDIT="@Sgkmods13"
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
 LOGFILE="${TMPDIR:-/data/data/com.termux/files/usr/tmp}/spotdl-install.log"
 
+# Persistent state: remembered device fingerprint + which components
+# were actually installed, so re-runs don't re-detect/re-install blindly.
+STATE_DIR="$PREFIX/etc/spotdl-installer"
+STATE_FILE="$STATE_DIR/state"
+DEVICE_FILE="$STATE_DIR/device.info"
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+touch "$STATE_FILE" 2>/dev/null || true
+
+get_state() {  # get_state <key> -> value or empty
+    grep -m1 "^$1=" "$STATE_FILE" 2>/dev/null | cut -d= -f2-
+}
+
+set_state() {  # set_state <key> <value>
+    local tmp
+    tmp="$(mktemp "${STATE_DIR}/state.XXXXXX" 2>/dev/null || echo "$STATE_FILE.tmp")"
+    grep -v "^$1=" "$STATE_FILE" 2>/dev/null > "$tmp" || true
+    echo "$1=$2" >> "$tmp"
+    mv "$tmp" "$STATE_FILE"
+}
+
 # ============================================================
 #                 My Py Lib - SpotDL
 #          Complete Termux + Debian Installer
@@ -142,14 +162,14 @@ check_disk_space
 # Install required Termux packages
 # ------------------------------------------------------------
 
-echo "[1/11] Updating Termux..."
+echo "[1/12] Updating Termux..."
 if ! retry pkg update -y >> "$LOGFILE" 2>&1; then
     echo "  WARNING: pkg update failed after retries — continuing anyway,"
     echo "           but package installs below may fail too."
 fi
 
 echo
-echo "[2/11] Installing required Termux packages..."
+echo "[2/12] Installing required Termux packages..."
 if ! retry pkg install -y proot-distro coreutils grep sed curl >> "$LOGFILE" 2>&1; then
     die "Failed to install required Termux packages after retries. Check: $LOGFILE"
 fi
@@ -170,7 +190,7 @@ fi
 # ------------------------------------------------------------
 
 echo
-echo "[3/11] Requesting Termux storage permission..."
+echo "[3/12] Requesting Termux storage permission..."
 
 if [ ! -d "$HOME/storage/shared" ]; then
     termux-setup-storage || true
@@ -204,11 +224,37 @@ debian_installed() {
     return 1
 }
 
+# A rootfs directory existing doesn't mean it's usable — an interrupted
+# install, a killed proot-distro process, or storage running out mid-
+# extraction can all leave a rootfs directory present but broken. Verify
+# it can actually run a command before trusting it.
+debian_healthy() {
+    proot-distro login debian -- bash -lc 'command -v apt >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1' \
+        >> "$LOGFILE" 2>&1
+}
+
+repair_debian() {
+    echo "  Repairing Debian install (removing and reinstalling)..."
+    proot-distro remove debian >> "$LOGFILE" 2>&1 || true
+    rm -rf "$PREFIX/var/lib/proot-distro/installed-rootfs/debian" 2>/dev/null || true
+    retry proot-distro install debian >> "$LOGFILE" 2>&1
+}
+
 echo
-echo "[4/11] Checking Debian..."
+echo "[4/12] Checking Debian..."
 
 if debian_installed; then
-    echo "Debian already installed."
+    echo "Debian found — verifying it's not corrupted..."
+    if debian_healthy; then
+        echo "Debian already installed and healthy."
+    else
+        echo "Debian install looks corrupted (rootfs present but not usable)."
+        if ! repair_debian; then
+            die "Debian repair failed. This is often a proot/kernel compatibility"$'\n'"       issue (see warning above) or insufficient storage. Log: $LOGFILE"
+        fi
+        debian_healthy || die "Debian still not usable after repair. Log: $LOGFILE"
+        echo "Debian repaired successfully."
+    fi
 else
     echo "Installing Debian..."
     if ! retry proot-distro install debian >> "$LOGFILE" 2>&1; then
@@ -221,7 +267,26 @@ fi
 # ------------------------------------------------------------
 
 echo
-echo "[5/11] Installing SpotDL inside Debian..."
+echo "[5/12] Checking SpotDL inside Debian..."
+
+# Same idea as the Debian check above: a spotdl-env directory existing
+# doesn't mean it works. A venv can be left half-created (interrupted
+# pip install, corrupted symlinks after an OS/Termux update) while its
+# activate script still exists on disk. Verify it actually runs.
+spotdl_venv_healthy() {
+    proot-distro login debian -- bash -lc \
+        'test -f "$HOME/spotdl-env/bin/activate" && source "$HOME/spotdl-env/bin/activate" && command -v spotdl >/dev/null 2>&1 && spotdl --version >/dev/null 2>&1' \
+        >> "$LOGFILE" 2>&1
+}
+
+if spotdl_venv_healthy; then
+    echo "SpotDL already installed and working — skipping reinstall."
+else
+    if proot-distro login debian -- bash -lc 'test -d "$HOME/spotdl-env"' >> "$LOGFILE" 2>&1; then
+        echo "Existing SpotDL environment looks corrupted — removing it before reinstall..."
+        proot-distro login debian -- bash -lc 'rm -rf "$HOME/spotdl-env"' >> "$LOGFILE" 2>&1 || true
+    fi
+    echo "Installing SpotDL inside Debian..."
 
 cat > "$PREFIX/.spotdl_debian_setup.sh" <<'DEBIAN_SETUP'
 #!/bin/bash
@@ -288,14 +353,20 @@ then
     die "SpotDL setup inside Debian failed. Check: $LOGFILE"$'\n'"       Common causes: no network inside proot, or apt mirror down."
 fi
 
-rm -f "$PREFIX/.spotdl_debian_setup.sh"
+    rm -f "$PREFIX/.spotdl_debian_setup.sh"
+
+    if ! spotdl_venv_healthy; then
+        die "SpotDL was installed but still fails a health check. Log: $LOGFILE"
+    fi
+    echo "SpotDL installed and verified working."
+fi
 
 # ------------------------------------------------------------
 # Create Termux command
 # ------------------------------------------------------------
 
 echo
-echo "[6/11] Creating spotdl-debian command..."
+echo "[6/12] Creating spotdl-debian command..."
 
 cat > "$PREFIX/bin/spotdl-debian" <<'LAUNCHER'
 #!/data/data/com.termux/files/usr/bin/bash
@@ -325,12 +396,72 @@ LAUNCHER
 chmod +x "$PREFIX/bin/spotdl-debian"
 
 # ------------------------------------------------------------
+# Repair command — force a clean reinstall of Debian and/or the
+# spotdl venv without re-running the whole installer.
+# ------------------------------------------------------------
+
+echo
+echo "[7/12] Creating spotdl-repair command..."
+
+cat > "$PREFIX/bin/spotdl-repair" <<'REPAIR'
+#!/data/data/com.termux/files/usr/bin/bash
+set -uo pipefail
+
+echo "================================================"
+echo "          SpotDL Repair - @Sgkmods13"
+echo "================================================"
+echo
+echo "1) Repair Debian (remove + reinstall)"
+echo "2) Repair SpotDL environment only (keep Debian)"
+echo "3) Repair both"
+echo "4) Exit"
+echo
+read -p "Select [1-4]: " CHOICE
+
+repair_debian() {
+    echo "Removing existing Debian install..."
+    proot-distro remove debian 2>/dev/null || true
+    rm -rf "$PREFIX/var/lib/proot-distro/installed-rootfs/debian" 2>/dev/null || true
+    echo "Reinstalling Debian..."
+    proot-distro install debian
+}
+
+repair_venv() {
+    echo "Removing existing SpotDL environment..."
+    proot-distro login debian -- bash -lc 'rm -rf "$HOME/spotdl-env"' 2>/dev/null || true
+    echo "Rebuilding SpotDL environment..."
+    proot-distro login debian -- bash -lc '
+        export DEBIAN_FRONTEND=noninteractive
+        apt update && apt install -y python3 python3-pip python3-venv ffmpeg curl ca-certificates
+        python3 -m venv "$HOME/spotdl-env"
+        source "$HOME/spotdl-env/bin/activate"
+        python -m pip install --upgrade pip
+        python -m pip install --upgrade spotdl
+        spotdl --version
+    '
+}
+
+case "$CHOICE" in
+    1) repair_debian ;;
+    2) repair_venv ;;
+    3) repair_debian && repair_venv ;;
+    4) exit 0 ;;
+    *) echo "Invalid choice."; exit 1 ;;
+esac
+
+echo
+echo "Done. Run 'spotdl-doctor' to verify."
+REPAIR
+
+chmod +x "$PREFIX/bin/spotdl-repair"
+
+# ------------------------------------------------------------
 # Diagnostics command — run this on any device that fails, and
 # paste its output when reporting an issue.
 # ------------------------------------------------------------
 
 echo
-echo "[7/11] Creating spotdl-doctor diagnostics command..."
+echo "[8/12] Creating spotdl-doctor diagnostics command..."
 
 cat > "$PREFIX/bin/spotdl-doctor" <<'DOCTOR'
 #!/data/data/com.termux/files/usr/bin/bash
@@ -380,6 +511,11 @@ if command -v proot >/dev/null 2>&1; then
 fi
 if [ -d "$PREFIX/var/lib/proot-distro/installed-rootfs/debian" ]; then
     echo "Debian rootfs  : present"
+    if proot-distro login debian -- bash -lc 'command -v apt >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1' 2>/dev/null; then
+        echo "Debian health  : OK"
+    else
+        echo "Debian health  : CORRUPTED — run 'spotdl-repair' option 1"
+    fi
 else
     echo "Debian rootfs  : NOT installed"
 fi
@@ -388,7 +524,11 @@ echo
 echo "-- SpotDL --"
 if proot-distro login debian -- bash -lc 'test -f "$HOME/spotdl-env/bin/activate"' 2>/dev/null; then
     echo "spotdl venv    : present"
-    proot-distro login debian -- bash -lc 'source "$HOME/spotdl-env/bin/activate" && spotdl --version' 2>/dev/null
+    if proot-distro login debian -- bash -lc 'source "$HOME/spotdl-env/bin/activate" && spotdl --version' 2>/dev/null; then
+        echo "spotdl health  : OK"
+    else
+        echo "spotdl health  : CORRUPTED — run 'spotdl-repair' option 2"
+    fi
 else
     echo "spotdl venv    : NOT found"
 fi
@@ -396,6 +536,7 @@ echo
 
 echo "================================================"
 echo "Paste the output above when reporting an issue."
+echo "Use 'spotdl-repair' to fix anything marked CORRUPTED."
 echo "================================================"
 DOCTOR
 
@@ -406,7 +547,7 @@ chmod +x "$PREFIX/bin/spotdl-doctor"
 # ------------------------------------------------------------
 
 echo
-echo "[8/11] Creating Termux:Widget directories..."
+echo "[9/12] Creating Termux:Widget directories..."
 
 mkdir -p "$HOME/.shortcuts"
 mkdir -p "$HOME/.shortcuts/tasks"
@@ -416,7 +557,7 @@ mkdir -p "$HOME/.shortcuts/tasks"
 # ------------------------------------------------------------
 
 echo
-echo "[9/11] Creating SpotDL Widget..."
+echo "[10/12] Creating SpotDL Widget..."
 
 cat > "$HOME/.shortcuts/SpotDL" <<'WIDGET'
 #!/data/data/com.termux/files/usr/bin/bash
@@ -574,7 +715,7 @@ chmod 700 "$HOME/.shortcuts/SpotDL"
 # ------------------------------------------------------------
 
 echo
-echo "[10/11] Creating permission helper..."
+echo "[11/12] Creating permission helper..."
 
 cat > "$PREFIX/bin/spotdl-permissions" <<'PERMISSIONS'
 #!/data/data/com.termux/files/usr/bin/bash
@@ -611,7 +752,7 @@ chmod +x "$PREFIX/bin/spotdl-permissions"
 # ------------------------------------------------------------
 
 echo
-echo "[11/11] Finalizing..."
+echo "[12/12] Finalizing..."
 
 echo
 echo "================================================"
@@ -625,6 +766,7 @@ echo
 echo "Termux commands:"
 echo "  spotdl-debian    - run spotdl directly"
 echo "  spotdl-doctor    - diagnose problems on this device"
+echo "  spotdl-repair    - fix a corrupted Debian or SpotDL install"
 echo
 echo "Widget:"
 echo "  SpotDL"
