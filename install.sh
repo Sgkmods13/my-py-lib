@@ -61,8 +61,11 @@ die() {
 
 # Retry a flaky command a few times before giving up (mobile networks /
 # mirror hiccups are the #1 cause of installs failing halfway through).
+# Tries/delay are overridable per-call via RETRY_TRIES/RETRY_DELAY env vars,
+# since a ~100MB+ rootfs download over mobile data needs a much more
+# patient retry budget than a small package install does.
 retry() {
-    local tries=3 n=1 delay=3
+    local tries="${RETRY_TRIES:-3}" n=1 delay="${RETRY_DELAY:-3}"
     until "$@"; do
         if [ "$n" -ge "$tries" ]; then
             return 1
@@ -353,10 +356,25 @@ debian_healthy() {
         >> "$LOGFILE" 2>&1
 }
 
+# Drop any cached Debian rootfs tarball before repairing. proot-distro
+# already discards a tarball that fails its own checksum check, but a
+# download that got cut short mid-transfer over flaky mobile data can
+# still leave a cached file behind in other failure modes - forcing a
+# fresh download here removes that as a possible cause instead of
+# silently reusing whatever is sitting in the cache.
+clear_debian_dlcache() {
+    rm -f "$PREFIX"/var/lib/proot-distro/dlcache/*debian* 2>>"$LOGFILE" || true
+}
+
+# The rootfs download+extract is a large transfer (100MB+) - on mobile
+# data that needs a far more patient retry budget than the short 3-try/
+# 3-second default used for small package installs, or a couple of slow
+# seconds looks identical to a permanent failure.
 repair_debian() {
     echo "  Repairing Debian install (removing and reinstalling)..."
     proot-distro remove debian >> "$LOGFILE" 2>&1 || true
-    retry proot-distro install debian >> "$LOGFILE" 2>&1
+    clear_debian_dlcache
+    RETRY_TRIES=5 RETRY_DELAY=10 retry proot-distro install debian >> "$LOGFILE" 2>&1
 }
 
 echo
@@ -369,20 +387,40 @@ if debian_installed; then
     else
         echo "Debian install looks corrupted (rootfs present but not usable)."
         if ! repair_debian; then
-            die "Debian repair failed. This is often a proot/kernel compatibility"$'\n'"       issue (see warning above) or insufficient storage. Log: $LOGFILE"
+            echo
+            echo "---- last 20 lines of the log (the actual error) ----"
+            tail -n 20 "$LOGFILE" 2>/dev/null
+            echo "-------------------------------------------------------"
+            die "Debian repair failed. See the error above - it's usually a"$'\n'"       flaky connection during the rootfs download/extraction, or"$'\n'"       insufficient storage. Full log: $LOGFILE"
         fi
-        debian_healthy || die "Debian still not usable after repair. Log: $LOGFILE"
+        if ! debian_healthy; then
+            echo
+            echo "---- last 20 lines of the log (the actual error) ----"
+            tail -n 20 "$LOGFILE" 2>/dev/null
+            echo "-------------------------------------------------------"
+            die "Debian still not usable after repair. See the error above. Log: $LOGFILE"
+        fi
         echo "Debian repaired successfully."
     fi
 else
     echo "Installing Debian..."
-    if ! retry proot-distro install debian >> "$LOGFILE" 2>&1; then
+    if ! RETRY_TRIES=5 RETRY_DELAY=10 retry proot-distro install debian >> "$LOGFILE" 2>&1; then
         echo "  Initial install failed - clearing any stale broken state and retrying..."
         if ! repair_debian; then
-            die "Debian install failed after retries and repair attempt. This is often"$'\n'"       a proot/kernel compatibility issue (see warning above) or"$'\n'"       insufficient storage. Log: $LOGFILE"
+            echo
+            echo "---- last 20 lines of the log (the actual error) ----"
+            tail -n 20 "$LOGFILE" 2>/dev/null
+            echo "-------------------------------------------------------"
+            die "Debian install failed after retries and repair attempt. See the error"$'\n'"       above - it's usually a flaky connection during the rootfs"$'\n'"       download/extraction, or insufficient storage. Log: $LOGFILE"
         fi
     fi
-    debian_healthy || die "Debian installed but failed a health check. Log: $LOGFILE"
+    if ! debian_healthy; then
+        echo
+        echo "---- last 20 lines of the log (the actual error) ----"
+        tail -n 20 "$LOGFILE" 2>/dev/null
+        echo "-------------------------------------------------------"
+        die "Debian installed but failed a health check. See the error above. Log: $LOGFILE"
+    fi
 fi
 
 # ------------------------------------------------------------
@@ -544,8 +582,19 @@ read -p "Select [1-4]: " CHOICE
 repair_debian() {
     echo "Removing existing Debian install..."
     proot-distro remove debian 2>/dev/null || true
-    echo "Reinstalling Debian..."
-    proot-distro install debian
+    echo "Clearing any cached Debian rootfs tarball (forces a fresh download)..."
+    rm -f "$PREFIX"/var/lib/proot-distro/dlcache/*debian* 2>/dev/null || true
+    echo "Reinstalling Debian (this is a large download - retrying patiently on mobile data)..."
+    local tries=5 n=1 delay=10
+    until proot-distro install debian; do
+        if [ "$n" -ge "$tries" ]; then
+            echo "Debian install failed after $tries attempts."
+            return 1
+        fi
+        echo "  (attempt $n failed, retrying in ${delay}s...)"
+        sleep "$delay"
+        n=$((n + 1))
+    done
 }
 
 repair_venv() {
@@ -1047,4 +1096,4 @@ echo "Android home screen and refresh it."
 echo
 echo "                 @Sgkmods13"
 echo "================================================"
- 
+
